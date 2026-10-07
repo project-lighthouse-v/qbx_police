@@ -405,17 +405,31 @@ RegisterNetEvent('police:server:RobPlayer', function(targetSrc)
     exports.qbx_core:Notify(player.PlayerData.source, locale('info.stolen_money', money), 'inform')
 end)
 
-RegisterNetEvent('police:server:Impound', function(plate, fullImpound, price, body, engine, fuel)
+RegisterNetEvent('police:server:Impound', function(plate, fullImpound, price, body, engine, fuel, netId)
     local src = source
-    price = price or 0
-    if not IsVehicleOwned(plate) then return end
-    if not fullImpound then
-        ImpoundWithPrice(price, body, engine, fuel, plate)
-        exports.qbx_core:Notify(src, locale('info.vehicle_taken_depot', price), 'inform')
-    else
-        ImpoundForever(body, engine, fuel, plate)
-        exports.qbx_core:Notify(src, locale('info.vehicle_seized'), 'inform')
+    local player = exports.qbx_core:GetPlayer(src)
+    if not player or not IsLeoAndOnDuty(player) then return end
+    if type(plate) ~= 'string' or type(netId) ~= 'number' then return end
+
+    local vehicle = NetworkGetEntityFromNetworkId(netId)
+    if not DoesEntityExist(vehicle) or qbx.getVehiclePlate(vehicle) ~= plate then return end
+    if #(GetEntityCoords(GetPlayerPed(src)) - GetEntityCoords(vehicle)) > 10.0 then return end
+
+    price = tonumber(price) or 0
+    body, engine, fuel = tonumber(body), tonumber(engine), tonumber(fuel)
+    if price < 0 or not body or not engine or not fuel then return end
+
+    if IsVehicleOwned(plate) then
+        if not fullImpound then
+            ImpoundWithPrice(price, body, engine, fuel, plate)
+            exports.qbx_core:Notify(src, locale('info.vehicle_taken_depot', price), 'inform')
+        else
+            ImpoundForever(body, engine, fuel, plate)
+            exports.qbx_core:Notify(src, locale('info.vehicle_seized'), 'inform')
+        end
     end
+
+    DeleteEntity(vehicle)
 end)
 
 RegisterNetEvent('evidence:server:UpdateStatus', function(data)
@@ -578,6 +592,70 @@ RegisterNetEvent('police:server:SetTracker', function(targetId)
         TriggerClientEvent('police:client:SetTracker', targetId, true)
     end
 end)
+
+RegisterNetEvent('police:server:IssueFine', function(targetSrc, lawViolated, fineAmount, notes)
+    local src = source
+    if type(targetSrc) ~= 'number' or not math.tointeger(targetSrc) or targetSrc <= 0 or targetSrc == src
+        or type(fineAmount) ~= 'number' or not math.tointeger(fineAmount) or fineAmount < 1 or fineAmount > (sharedConfig.maxFine or 100000)
+        or type(lawViolated) ~= 'string' or not lawViolated:find('%S') or #lawViolated > 200
+        or (notes ~= nil and (type(notes) ~= 'string' or #notes > 1000)) then
+        return exports.qbx_core:Notify(src, locale('error.invalid_fine'), 'error')
+    end
+
+    local officer = exports.qbx_core:GetPlayer(src)
+    if not officer or not IsLeoAndOnDuty(officer) then
+        return exports.qbx_core:Notify(src, locale('error.on_duty_police_only'), 'error')
+    end
+
+    local targetPlayer = exports.qbx_core:GetPlayer(targetSrc)
+    if not targetPlayer then
+        return exports.qbx_core:Notify(src, locale('error.player_not_found'), 'error')
+    end
+    if GetPlayerPed(src) == 0 or GetPlayerPed(targetSrc) == 0
+        or GetPlayerRoutingBucket(src) ~= GetPlayerRoutingBucket(targetSrc) or isTargetTooFar(src, targetSrc, 5.0) then
+        return exports.qbx_core:Notify(src, locale('error.target_too_far'), 'error')
+    end
+
+    local officerInfo = {
+        id = officer.PlayerData.source,
+        citizenId = officer.PlayerData.citizenid,
+        name = officer.PlayerData.charinfo.firstname .. ' ' .. officer.PlayerData.charinfo.lastname,
+        callsign = officer.PlayerData.metadata.callsign or 'N/A'
+    }
+
+    if not targetPlayer.Functions.RemoveMoney('bank', fineAmount, 'police-fine') then
+        return exports.qbx_core:Notify(src, locale('error.insufficient_funds'), 'error')
+    end
+
+    local success, deposited = pcall(function()
+        return exports['Renewed-Banking']:addAccountMoney('police', fineAmount)
+    end)
+    if not success or not deposited then
+        targetPlayer.Functions.AddMoney('bank', fineAmount, 'police-fine-refund')
+        return exports.qbx_core:Notify(src, locale('error.fine_payment_failed'), 'error')
+    end
+
+    exports.qbx_core:Notify(targetPlayer.PlayerData.source,
+        locale('success.fine_issued', fineAmount, lawViolated, officerInfo.name, officerInfo.callsign),
+        'inform'
+    )
+    exports.qbx_core:Notify(src,
+        locale('success.fine_sent', targetPlayer.PlayerData.charinfo.firstname .. ' ' .. targetPlayer.PlayerData.charinfo.lastname, fineAmount),
+        'success'
+    )
+
+    if sharedConfig.fineLogger then
+        lib.logger(src, 'issue_fine', json.encode({
+            officer = officerInfo.name,
+            officerCallsign = officerInfo.callsign,
+            target = targetPlayer.PlayerData.charinfo.firstname .. ' ' .. targetPlayer.PlayerData.charinfo.lastname,
+            amount = fineAmount,
+            reason = lawViolated,
+            notes = notes
+        }))
+    end
+end)
+
 
 AddEventHandler('onServerResourceStart', function(resource)
     if resource ~= 'ox_inventory' then return end
